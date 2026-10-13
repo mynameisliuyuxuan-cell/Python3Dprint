@@ -1,0 +1,15 @@
+# Python-generated files and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+ENV/
+
+# IDE files that are machine/session specific
+.idea/workspace.xml
+.idea/shelf/
+
+# Local credentials
+.env
+.env.*
+!.env.example

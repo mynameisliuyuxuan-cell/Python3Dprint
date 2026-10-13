@@ -1,0 +1,39 @@
+from pathlib import Path
+from vedo import load, show
+
+# 模型和贴图位置
+MODEL_DIR = Path(r"E:\moon")
+MODEL_PATH = MODEL_DIR / "Moon 2K.obj"
+TEXTURE_PATH = MODEL_DIR / "Textures" / "Diffuse_2K.png"
+
+# 检查文件
+if not MODEL_PATH.is_file():
+    raise FileNotFoundError(f"找不到模型：{MODEL_PATH}")
+
+if not TEXTURE_PATH.is_file():
+    raise FileNotFoundError(f"找不到贴图：{TEXTURE_PATH}")
+
+# 加载模型
+moon = load(str(MODEL_PATH))
+
+if moon is None:
+    raise RuntimeError(f"模型加载失败：{MODEL_PATH}")
+
+# 白色底色，避免影响贴图颜色
+moon.color("white")
+
+# 添加月球表面贴图
+moon.texture(str(TEXTURE_PATH))
+
+print("模型加载成功：", MODEL_PATH)
+print("贴图加载成功：", TEXTURE_PATH)
+print("鼠标左键拖动旋转，滚轮缩放。")
+
+# 显示模型
+show(
+    moon,
+    axes=1,
+    bg="black",
+    title="Moon - Textured Model",
+    size=(1000, 800),
+).close()
