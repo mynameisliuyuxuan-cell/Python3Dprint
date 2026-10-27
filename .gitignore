@@ -13,3 +13,5 @@ ENV/
 .env
 .env.*
 !.env.example
+# Generated Prusa comparison files (STL, G-code and runtime cache)
+/1027/prusa_compare_cache/

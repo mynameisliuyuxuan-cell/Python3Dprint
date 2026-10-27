@@ -1,0 +1,311 @@
+"""Simple build-plate supports using only numpy, VTK and the existing vedo.
+
+Model: red. Supports: green. Model starts Y-up and is placed Z-up.
+Run normally for the interactive viewer, or --preview FILE for a PNG.
+"""
+from pathlib import Path
+import argparse
+import math
+import time
+
+import numpy as np
+import vtk
+from vtk.util.numpy_support import vtk_to_numpy, numpy_to_vtk
+from vedo import load
+
+
+# ======================= 可调参数 =======================
+MODEL_PATH = Path(__file__).resolve().parent / 'ORIGAMI_Chat_Free.obj'
+MODEL_HEIGHT = 80.0           # 统一模型高度；演示按毫米理解
+OVERHANG_ANGLE = 45.0        # 朝下表面与水平面的夹角阈值，小于此值生成支撑
+SUPPORT_SPACING = 3.0        # 支撑采样间距；越小越密
+SUPPORT_RADIUS = 0.55        # 支撑柱半径
+TIP_HEIGHT = 2.0            # 顶端锥形部分的高度
+CONTACT_GAP = 0.25          # 与模型底面的竖直间隙
+MIN_SUPPORT_HEIGHT = 1.0
+ROTATION_SPEED = 2.0        # 每秒旋转角度
+# ========================================================
+
+
+def prepare_model():
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f'找不到猫模型：{MODEL_PATH}')
+    model = load(str(MODEL_PATH))
+    if not hasattr(model, 'dataset'):
+        raise RuntimeError('OBJ 没有加载成单个网格')
+    # 原始猫为 Y-up：绕 X 旋转 +90 度后，原 Y 成为新 Z。
+    original = vtk_to_numpy(model.dataset.GetPoints().GetData())
+    points = original[:, [0, 2, 1]].astype(np.float64).copy()
+    points[:, 1] *= -1
+    low, high = points.min(axis=0), points.max(axis=0)
+    height = high[2] - low[2]
+    if height <= 0:
+        raise ValueError('模型高度无效')
+    points -= np.array([(low[0] + high[0]) / 2,
+                        (low[1] + high[1]) / 2, low[2]])
+    points *= MODEL_HEIGHT / height
+    mesh = vtk.vtkPolyData()
+    mesh.DeepCopy(model.dataset)
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetData(numpy_to_vtk(points, deep=True))
+    mesh.SetPoints(vtk_points)
+    # OBJ normals describe the original Y-up geometry. Recompute after rotation.
+    mesh.GetPointData().SetNormals(None)
+    mesh.GetCellData().SetNormals(None)
+
+    triangle = vtk.vtkTriangleFilter()
+    triangle.SetInputData(mesh)
+    clean = vtk.vtkCleanPolyData()
+    clean.SetInputConnection(triangle.GetOutputPort())
+    normals = vtk.vtkPolyDataNormals()
+    normals.SetInputConnection(clean.GetOutputPort())
+    normals.ConsistencyOn()
+    normals.AutoOrientNormalsOn()
+    normals.SplittingOff()
+    normals.ComputeCellNormalsOn()
+    normals.ComputePointNormalsOff()
+    normals.Update()
+    result = vtk.vtkPolyData()
+    result.DeepCopy(normals.GetOutput())
+    return result
+
+
+def scan_model(mesh):
+    """Cache the closest upward ray hits once, before slider interactions."""
+    locator = vtk.vtkStaticCellLocator()
+    locator.SetDataSet(mesh)
+    locator.BuildLocator()
+    xmin, xmax, ymin, ymax, zmin, zmax = mesh.GetBounds()
+    samples = []
+    for x in np.arange(xmin + SUPPORT_SPACING / 2, xmax, SUPPORT_SPACING):
+        for y in np.arange(ymin + SUPPORT_SPACING / 2, ymax, SUPPORT_SPACING):
+            t, sub, cell = vtk.reference(0.0), vtk.reference(0), vtk.reference(0)
+            point, local = [0.0] * 3, [0.0] * 3
+            hit = locator.IntersectWithLine(
+                (x, y, zmin - 1), (x, y, zmax + 1), 1e-6,
+                t, point, local, sub, cell,
+            )
+            if hit:
+                samples.append((float(x), float(y), float(point[2]), int(cell)))
+    return samples
+
+
+def generate_supports(mesh, threshold=OVERHANG_ANGLE, samples=None):
+    """Grid rays select the first surface above the bed.
+
+    Only downward overhang faces receive supports. Selecting the first hit
+    prevents a support from continuing through a foot or other model surface.
+    Overhangs blocked by lower model geometry are deliberately not handled by
+    this build-plate-only demonstrator.
+    """
+    if SUPPORT_SPACING <= 0 or SUPPORT_RADIUS <= 0:
+        raise ValueError('支撑间距、半径必须大于零')
+    if not 0 < threshold < 90 or CONTACT_GAP < 0:
+        raise ValueError('悬垂角度须在 0～90° 之间，接触间隙不能为负')
+    normals = vtk_to_numpy(mesh.GetCellData().GetNormals())
+    needs_support = normals[:, 2] < -math.cos(math.radians(threshold))
+    if samples is None:
+        samples = scan_model(mesh)
+    xy_points, lines = vtk.vtkPoints(), vtk.vtkCellArray()
+    append = vtk.vtkAppendPolyData()
+    columns = []
+    for x, y, roof_z, cell in samples:
+            top = roof_z - CONTACT_GAP
+            if not needs_support[cell] or top < MIN_SUPPORT_HEIGHT:
+                continue
+            tip_height = min(TIP_HEIGHT, top * 0.4)
+            shaft_top = top - tip_height
+            a = xy_points.InsertNextPoint(float(x), float(y), 0)
+            b = xy_points.InsertNextPoint(float(x), float(y), shaft_top)
+            lines.InsertNextCell(2)
+            lines.InsertCellPoint(a)
+            lines.InsertCellPoint(b)
+            # Cone apex points upward; base meets the vertical tube.
+            cone = vtk.vtkConeSource()
+            cone.SetDirection(0, 0, 1)
+            cone.SetCenter(float(x), float(y), shaft_top + tip_height / 2)
+            cone.SetRadius(SUPPORT_RADIUS)
+            cone.SetHeight(tip_height)
+            cone.SetResolution(12)
+            cone.CappingOn()
+            cone.Update()
+            append.AddInputData(cone.GetOutput())
+            columns.append((float(x), float(y), float(top), float(roof_z), int(cell)))
+    if columns:
+        data = vtk.vtkPolyData()
+        data.SetPoints(xy_points)
+        data.SetLines(lines)
+        tube = vtk.vtkTubeFilter()
+        tube.SetInputData(data)
+        tube.SetRadius(SUPPORT_RADIUS)
+        tube.SetNumberOfSides(12)
+        tube.CappingOn()
+        tube.Update()
+        append.AddInputData(tube.GetOutput())
+        append.Update()
+        output = vtk.vtkPolyData()
+        output.DeepCopy(append.GetOutput())
+    else:
+        output = vtk.vtkPolyData()
+    print(f'检测到朝下悬垂三角面：{int(needs_support.sum())}')
+    print(f'生成平台直柱支撑：{len(columns)} 根')
+    return output, columns
+
+
+def actor_for(data, color, opacity=1):
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputData(data)
+    mapper.ScalarVisibilityOff()
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetColor(*color)
+    actor.GetProperty().SetOpacity(opacity)
+    actor.GetProperty().SetAmbient(0.25)
+    return actor
+
+
+def main(preview=None):
+    mesh = prepare_model()
+    samples = scan_model(mesh)
+    support_mesh, columns = generate_supports(mesh, samples=samples)
+    renderer = vtk.vtkRenderer()
+    renderer.SetBackground(0.035, 0.045, 0.065)
+    window = vtk.vtkRenderWindow()
+    window.SetWindowName('Cat - Simple VTK Supports')
+    window.SetSize(1200, 900)
+    window.AddRenderer(renderer)
+    model_actor = actor_for(mesh, (0.92, 0.10, 0.14))
+    support_actor = actor_for(support_mesh, (0.10, 0.95, 0.30))
+    renderer.AddActor(model_actor)
+    renderer.AddActor(support_actor)
+
+    bounds = mesh.GetBounds()
+    bed = vtk.vtkPlaneSource()
+    bed.SetOrigin(bounds[0] - 8, bounds[2] - 8, -0.1)
+    bed.SetPoint1(bounds[1] + 8, bounds[2] - 8, -0.1)
+    bed.SetPoint2(bounds[0] - 8, bounds[3] + 8, -0.1)
+    bed.Update()
+    renderer.AddActor(actor_for(bed.GetOutput(), (0.18, 0.21, 0.25)))
+
+    label = vtk.vtkTextActor()
+    def update_label(angle, count):
+        label.SetInput(
+            f'Red: model   Green: supports   |   {count} columns\n'
+            f'Face angle < {angle:g} deg   (0: downward flat, 90: vertical)\n'
+            'Drag top slider: live angle threshold   |   Z up / feet on bed\n'
+            'M: transparency   S: supports   Space: rotation   R: reset view'
+        )
+    update_label(OVERHANG_ANGLE, len(columns))
+    label.SetPosition(16, 16)
+    label.GetTextProperty().SetFontSize(18)
+    label.GetTextProperty().SetColor(0.95, 0.95, 0.95)
+    renderer.AddViewProp(label)
+
+    def reset_camera():
+        camera = renderer.GetActiveCamera()
+        camera.SetPosition(190, -150, 110)
+        camera.SetFocalPoint(0, 0, MODEL_HEIGHT * 0.4)
+        camera.SetViewUp(0, 0, 1)
+        renderer.ResetCamera()
+
+    reset_camera()
+    if preview:
+        window.SetOffScreenRendering(1)
+
+    interactor = vtk.vtkRenderWindowInteractor()
+    interactor.SetRenderWindow(window)
+    interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
+    state = {'rotate': True, 'transparent': False, 'last': time.perf_counter()}
+    state['angle'] = OVERHANG_ANGLE
+    slider_rep = vtk.vtkSliderRepresentation2D()
+    slider_rep.SetMinimumValue(5)
+    slider_rep.SetMaximumValue(85)
+    slider_rep.SetValue(OVERHANG_ANGLE)
+    slider_rep.SetTitleText('Overhang face angle to bed (degrees)')
+    slider_rep.GetPoint1Coordinate().SetCoordinateSystemToNormalizedDisplay()
+    slider_rep.GetPoint1Coordinate().SetValue(0.18, 0.92)
+    slider_rep.GetPoint2Coordinate().SetCoordinateSystemToNormalizedDisplay()
+    slider_rep.GetPoint2Coordinate().SetValue(0.82, 0.92)
+    slider_rep.SetSliderLength(0.025)
+    slider_rep.SetSliderWidth(0.035)
+    slider_rep.GetTitleProperty().SetColor(0.95, 0.95, 0.95)
+    slider_rep.GetLabelProperty().SetColor(0.95, 0.95, 0.95)
+    slider_rep.GetSliderProperty().SetColor(0.10, 0.95, 0.30)
+    slider = vtk.vtkSliderWidget()
+    slider.SetInteractor(interactor)
+    slider.SetRepresentation(slider_rep)
+    slider.SetAnimationModeToJump()
+
+    def on_threshold(obj, event):
+        angle = int(round(obj.GetRepresentation().GetValue()))
+        if angle == state['angle']:
+            return
+        new_data, new_columns = generate_supports(mesh, angle, samples)
+        support_actor.GetMapper().SetInputData(new_data)
+        state['angle'] = angle
+        update_label(angle, len(new_columns))
+        window.Render()
+
+    def on_slider_start(obj, event):
+        state['resume_rotation'] = state['rotate']
+        state['rotate'] = False
+
+    def on_slider_end(obj, event):
+        on_threshold(obj, event)
+        state['rotate'] = state.get('resume_rotation', False)
+
+    slider.AddObserver('StartInteractionEvent', on_slider_start)
+    slider.AddObserver('InteractionEvent', on_threshold)
+    slider.AddObserver('EndInteractionEvent', on_slider_end)
+
+    def on_key(obj, event):
+        key = obj.GetKeySym().lower()
+        if key == 'm':
+            state['transparent'] = not state['transparent']
+            model_actor.GetProperty().SetOpacity(0.25 if state['transparent'] else 1)
+        elif key == 's':
+            support_actor.SetVisibility(not support_actor.GetVisibility())
+        elif key == 'space':
+            state['rotate'] = not state['rotate']
+        elif key == 'r':
+            reset_camera()
+        window.Render()
+
+    def on_timer(obj, event):
+        now = time.perf_counter()
+        dt = min(now - state['last'], 0.15)
+        state['last'] = now
+        if state['rotate']:
+            renderer.GetActiveCamera().Azimuth(ROTATION_SPEED * dt)
+            renderer.ResetCameraClippingRange()
+            window.Render()
+
+    interactor.AddObserver('KeyPressEvent', on_key)
+    interactor.AddObserver('TimerEvent', on_timer)
+    interactor.Initialize()
+    slider.EnabledOn()
+    window.Render()
+    if preview:
+        # Exercise the same callbacks used when dragging the real slider.
+        for angle in (25, 65, OVERHANG_ANGLE):
+            slider_rep.SetValue(angle)
+            slider.InvokeEvent('InteractionEvent')
+        capture = vtk.vtkWindowToImageFilter()
+        capture.SetInput(window)
+        capture.Update()
+        writer = vtk.vtkPNGWriter()
+        writer.SetFileName(str(Path(preview).resolve()))
+        writer.SetInputConnection(capture.GetOutputPort())
+        writer.Write()
+        slider.EnabledOff()
+        window.Finalize()
+        print(f'预览已保存：{preview}')
+        return
+    interactor.CreateRepeatingTimer(30)
+    interactor.Start()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='猫模型简单平台支撑演示')
+    parser.add_argument('--preview', help='保存离屏预览 PNG，不启动交互窗口')
+    main(parser.parse_args().preview)
