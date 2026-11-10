@@ -109,23 +109,29 @@ def prepare_job(mesh, cache_root, angle, gap, style='organic'):
                 gcode=directory/'demo.gcode', style=style)
 
 
-def parse_support_gcode(path, center=CENTER):
+def parse_support_gcode(path, center=CENTER, *, include_print=False):
     """Read only positively extruding support/interface G0/G1 moves.
 
     Handle G90/G91, M82/M83 and G92. Arcs with support extrusion are rejected
-    rather than silently approximated or discarded.
+    rather than silently approximated or discarded. Optionally collect model
+    and support moves together, in file order, for the playback viewer.
     """
     position = dict(X=0.,Y=0.,Z=0.,E=0.)
     xyz_absolute = e_absolute = True
     role = ''
     segments, length, extrusion = [], 0., 0.
     roles = {}
+    print_moves, print_layers = [], []
+    new_layer = True
     number = re.compile(r'([XYZE])\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)')
     with Path(path).open(encoding='utf-8-sig',errors='strict') as handle:
         for raw in handle:
             command, _, comment = raw.partition(';')
-            if comment.strip().startswith('TYPE:'):
-                role = comment.strip()[5:].strip()
+            comment = comment.strip()
+            if comment.startswith('TYPE:'):
+                role = comment[5:].strip()
+            if include_print and comment == 'LAYER_CHANGE':
+                new_layer = True
             command = command.strip()
             if not command:
                 continue
@@ -145,24 +151,40 @@ def parse_support_gcode(path, center=CENTER):
             if 'E' in values:
                 position['E']=values['E'] if e_absolute else old['E']+values['E']
             de=position['E']-old['E']
-            support=role.casefold().startswith('support material')
+            role_key = role.casefold()
+            support = role_key.startswith('support material')
+            category = 'support' if support else None
+            if include_print and not support:
+                if 'perimeter' in role_key:
+                    category = 'wall'
+                elif 'infill' in role_key or role_key == 'gap fill':
+                    category = 'infill'
             distance=math.dist([old[a] for a in 'XYZ'],[position[a] for a in 'XYZ'])
-            if support and de>1e-7 and distance>1e-7:
+            if category and de>1e-7 and distance>1e-7:
                 if op in ('G2','G02','G3','G03'):
-                    raise ValueError('支撑路径包含圆弧，当前解析器不支持；请关闭圆弧拟合')
+                    raise ValueError('挤出路径包含圆弧，当前解析器不支持；请关闭圆弧拟合')
                 a=(old['X']-center[0],old['Y']-center[1],old['Z'])
                 b=(position['X']-center[0],position['Y']-center[1],position['Z'])
-                segments.append((a,b))
-                length+=distance
-                extrusion+=de
-                roles[role]=roles.get(role,0)+1
-    return dict(segments=segments, path_length=length,
-                filament_length=extrusion,
-                material_volume=extrusion*math.pi*(FILAMENT_DIAMETER/2)**2,
-                roles=roles)
+                if include_print:
+                    if new_layer:
+                        print_layers.append((len(print_moves), b[2]))
+                        new_layer = False
+                    print_moves.append((category, a, b))
+                if support:
+                    segments.append((a,b))
+                    length+=distance
+                    extrusion+=de
+                    roles[role]=roles.get(role,0)+1
+    result = dict(segments=segments, path_length=length,
+                  filament_length=extrusion,
+                  material_volume=extrusion*math.pi*(FILAMENT_DIAMETER/2)**2,
+                  roles=roles)
+    if include_print:
+        result.update(print_moves=print_moves, print_layers=print_layers)
+    return result
 
 
-def run_job(job, cancel=None, timeout=240):
+def run_job(job, cancel=None, timeout=240, *, include_print=False):
     started=time.perf_counter()
     complete=job['directory']/'complete.json'
     cached=job['gcode'].is_file() and complete.is_file()
@@ -191,12 +213,13 @@ def run_job(job, cancel=None, timeout=240):
             raise RuntimeError('PrusaSlicer 失败：'+output.decode('utf-8',errors='replace')[-1800:])
         if not job['gcode'].is_file():
             raise RuntimeError('PrusaSlicer 未产生 G-code')
-    result=parse_support_gcode(job['gcode'])
+    result=parse_support_gcode(job['gcode'], include_print=include_print)
     result.update(seconds=time.perf_counter()-started,cached=cached,
                   gcode_path=str(job['gcode']),style=job['style'])
     if not cached:
         complete.write_text(json.dumps({key:value for key,value in result.items()
-                                       if key!='segments'},ensure_ascii=False,indent=2),encoding='utf-8')
+                                       if key not in ('segments', 'print_moves', 'print_layers')},
+                                       ensure_ascii=False,indent=2),encoding='utf-8')
     return result
 
 
