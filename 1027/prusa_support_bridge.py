@@ -51,7 +51,7 @@ def oriented_model(mesh, x_angle=0., y_angle=0.):
     return output
 
 
-def demo_config(angle, gap, style='organic'):
+def demo_config(angle, gap, style='organic', *, density=10, pattern=None):
     if style not in ('organic','grid','snug'):
         raise ValueError('Unknown Prusa support style')
     # Full model STL has no embedded scripts. Explicitly clear all executable
@@ -74,22 +74,26 @@ def demo_config(angle, gap, style='organic'):
                     support_tree_angle=35, support_tree_angle_slow=25,
                     support_tree_branch_distance=3,
                     support_tree_tip_diameter=.8,
-                    fill_density='10%', perimeters=2,
+                    fill_density=f'{density:g}%', perimeters=2,
                     top_solid_layers=3, bottom_solid_layers=3,
                     skirts=0, brim_width=0, threads=2,
                     start_gcode='', end_gcode='', before_layer_gcode='',
                     layer_gcode='', toolchange_gcode='', post_process='')
+    if density == 100:
+        settings['fill_pattern'] = 'rectilinear'
+    elif pattern is not None:
+        settings['fill_pattern'] = pattern
     return '# Virtual demo printer. DO NOT PRINT THIS G-CODE.\n' + '\n'.join(
         f'{key} = {value}' for key,value in settings.items()) + '\n'
 
 
-def prepare_job(mesh, cache_root, angle, gap, style='organic'):
+def prepare_job(mesh, cache_root, angle, gap, style='organic', *, density=10, pattern=None):
     if not PRUSA_EXE.is_file():
         raise FileNotFoundError(f'未找到 PrusaSlicer：{PRUSA_EXE}')
     stl_writer = vtk.vtkSTLWriter()
     # Use geometry bytes for a stable cache identifier, independent of file names.
     points = vtk_to_numpy(mesh.GetPoints().GetData())
-    config = demo_config(angle,gap,style)
+    config = demo_config(angle, gap, style, density=density, pattern=pattern)
     signature = hashlib.sha256(points.tobytes()+config.encode('utf-8')+
                                str(PRUSA_EXE.stat().st_mtime_ns).encode()+b'bridge-v1').hexdigest()[:20]
     directory = Path(cache_root)/signature
@@ -157,8 +161,10 @@ def parse_support_gcode(path, center=CENTER, *, include_print=False):
             if include_print and not support:
                 if 'perimeter' in role_key:
                     category = 'wall'
-                elif 'infill' in role_key or role_key == 'gap fill':
+                elif role_key == 'internal infill':
                     category = 'infill'
+                elif 'infill' in role_key or role_key == 'gap fill':
+                    category = 'solid'
             distance=math.dist([old[a] for a in 'XYZ'],[position[a] for a in 'XYZ'])
             if category and de>1e-7 and distance>1e-7:
                 if op in ('G2','G02','G3','G03'):
